@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ミカン カウンター</title>
+<style>
+  :root { --bg:#f6f3ea; --ink:#1d2b1f; --leaf:#1f5a34; --mikan:#f08a12; --line:#cfc8b4; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,"Hiragino Sans","Noto Sans JP",sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:env(safe-area-inset-top) 12px 24px; }
+  h1 { font-size:1.1rem; margin:12px 0 8px; }
+  #view { position:relative; background:#000; border-radius:10px; overflow:hidden; }
+  canvas { width:100%; display:block; }
+  #count { position:absolute; left:10px; top:8px; background:rgba(0,0,0,.6); color:#fff; padding:4px 12px; border-radius:8px; font-size:2.4rem; font-weight:700; line-height:1.1; }
+  #count small { font-size:.8rem; font-weight:400; display:block; }
+  #status { font-size:.85rem; margin:8px 0; min-height:1.2em; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; align-items:center; }
+  button { font:inherit; padding:10px 14px; border-radius:8px; border:2px solid var(--leaf); background:#fff; color:var(--leaf); font-weight:600; }
+  button.main { background:var(--mikan); border-color:var(--mikan); color:#fff; }
+  button:focus-visible, input:focus-visible { outline:3px solid var(--mikan); outline-offset:2px; }
+  input[type=text] { font:inherit; padding:8px; border:2px solid var(--line); border-radius:8px; width:8em; }
+  label { font-size:.85rem; }
+  table { width:100%; border-collapse:collapse; font-size:.8rem; margin-top:8px; }
+  th, td { border-bottom:1px solid var(--line); padding:4px; text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ミカン カウンター(摘果前・オフライン)</h1>
+  <div id="view">
+    <canvas id="cv"></canvas>
+    <div id="count">0<small id="modeLabel">いま映っている数</small></div>
+  </div>
+  <div id="status">モデルを読み込み中…</div>
+
+  <div class="row">
+    <button id="start" class="main">カメラ開始</button>
+    <button id="reset">累計リセット</button>
+    <button id="mode">表示切替:フレーム/累計</button>
+  </div>
+  <div class="row">
+    <label>木のID <input type="text" id="tree" value="T01"></label>
+    <label>信頼度 <input type="range" id="conf" min="0.1" max="0.9" step="0.05" value="0.35"> <span id="confv">0.35</span></label>
+  </div>
+  <div class="row">
+    <button id="rec" class="main">この木を記録</button>
+    <button id="csv">CSV保存</button>
+    <button id="clr">記録を消す</button>
+  </div>
+  <table id="tbl"><thead><tr><th>時刻</th><th>木</th><th>フレーム最大</th><th>累計</th></tr></thead><tbody></tbody></table>
+</main>
+
+<!-- onnxruntime-web は lib/ に自分で置く(README参照)。CDNを使うとオフラインで動かない -->
+<script src="./lib/ort.min.js"></script>
+<script>
+"use strict";
+// ===== 設定 =====
+const MODEL_URL = "./model/best.onnx"; // YOLOv8をONNXにしたもの
+const SIZE = 640;                       // 学習時のimgszと同じにする
+const IOU_NMS = 0.5;
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+const video = document.createElement("video");
+video.playsInline = true; video.muted = true;
+const pre = document.createElement("canvas"); pre.width = pre.height = SIZE;
+const pctx = pre.getContext("2d", { willReadFrequently: true });
+
+let session = null, running = false, showTotal = false;
+let frameCount = 0, maxCount = 0, totalCount = 0;
+let tracks = [], nextId = 1, shift = { x: 0, y: 0 };
+let records = [];
+
+// ===== モデル読み込み =====
+async function loadModel() {
+  try {
+    ort.env.wasm.wasmPaths = "./lib/";
+    ort.env.wasm.numThreads = 1; // SharedArrayBuffer不要=iPhoneでも動きやすい
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
+    $("status").textContent = "準備OK。「カメラ開始」を押してください。";
+  } catch (e) {
+    $("status").textContent = "モデル読み込み失敗: " + e.message;
+  }
+}
+
+// ===== 前処理(レターボックス) =====
+function preprocess() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.min(SIZE / vw, SIZE / vh);
+  const w = vw * scale, h = vh * scale;
+  const px = (SIZE - w) / 2, py = (SIZE - h) / 2;
+  pctx.fillStyle = "#727272"; pctx.fillRect(0, 0, SIZE, SIZE);
+  pctx.drawImage(video, px, py, w, h);
+  const d = pctx.getImageData(0, 0, SIZE, SIZE).data;
+  const n = SIZE * SIZE, f = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    f[i] = d[i * 4] / 255; f[n + i] = d[i * 4 + 1] / 255; f[2 * n + i] = d[i * 4 + 2] / 255;
+  }
+  return { tensor: new ort.Tensor("float32", f, [1, 3, SIZE, SIZE]), scale, px, py };
+}
+
+// ===== 後処理(YOLOv8出力 [1, 4+nc, N]) =====
+function decode(out, scale, px, py, conf) {
+  const [, ch, N] = out.dims, nc = ch - 4, d = out.data, boxes = [];
+  for (let i = 0; i < N; i++) {
+    let best = 0;
+    for (let c = 0; c < nc; c++) { const s = d[(4 + c) * N + i]; if (s > best) best = s; }
+    if (best < conf) continue;
+    const cx = (d[i] - px) / scale, cy = (d[N + i] - py) / scale;
+    const w = d[2 * N + i] / scale, h = d[3 * N + i] / scale;
+    boxes.push({ x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2, cx, cy, w, h, s: best });
+  }
+  return nms(boxes);
+}
+function iou(a, b) {
+  const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+  const x2 = Math.min(a.x2, b.x2), y2 = Math.min(a.y2, b.y2);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return inter / (a.w * a.h + b.w * b.h - inter + 1e-9);
+}
+function nms(boxes) {
+  boxes.sort((a, b) => b.s - a.s);
+  const keep = [];
+  for (const b of boxes) if (keep.every(k => iou(k, b) < IOU_NMS)) keep.push(b);
+  return keep;
+}
+
+// ===== 簡易トラッカー(カメラを横に動かしたときの二重カウント対策) =====
+// 前フレームの平均移動量(shift)で位置を予測して近い物体を同一とみなす。
+function track(dets) {
+  const used = new Set(), moves = [];
+  for (const t of tracks) {
+    const px = t.x + shift.x, py = t.y + shift.y;
+    let bi = -1, bd = Infinity;
+    dets.forEach((d, i) => {
+      if (used.has(i)) return;
+      const dist = Math.hypot(d.cx - px, d.cy - py);
+      if (dist < bd && dist < Math.max(d.w, d.h) * 0.8) { bd = dist; bi = i; }
+    });
+    if (bi >= 0) {
+      used.add(bi);
+      moves.push([dets[bi].cx - t.x, dets[bi].cy - t.y]);
+      t.x = dets[bi].cx; t.y = dets[bi].cy; t.hits++; t.miss = 0;
+      if (!t.counted && t.hits >= 3) { t.counted = true; totalCount++; }
+    } else { t.miss++; t.x = px; t.y = py; }
+  }
+  if (moves.length >= 2) {
+    const med = a => a.sort((p, q) => p - q)[a.length >> 1];
+    const mx = med(moves.map(m => m[0])), my = med(moves.map(m => m[1]));
+    shift = { x: 0.6 * shift.x + 0.4 * mx, y: 0.6 * shift.y + 0.4 * my };
+  } else { shift = { x: shift.x * 0.8, y: shift.y * 0.8 }; }
+  dets.forEach((d, i) => { if (!used.has(i)) tracks.push({ id: nextId++, x: d.cx, y: d.cy, hits: 1, miss: 0, counted: false }); });
+  tracks = tracks.filter(t => t.miss < 15);
+}
+
+// ===== メインループ =====
+async function loop() {
+  if (!running) return;
+  const t0 = performance.now();
+  try {
+    const { tensor, scale, px, py } = preprocess();
+    const res = await session.run({ [session.inputNames[0]]: tensor });
+    const dets = decode(res[session.outputNames[0]], scale, px, py, parseFloat($("conf").value));
+    track(dets);
+    frameCount = dets.length; maxCount = Math.max(maxCount, frameCount);
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+    ctx.lineWidth = Math.max(2, cv.width / 300); ctx.strokeStyle = "#f08a12";
+    for (const b of dets) ctx.strokeRect(b.x1, b.y1, b.w, b.h);
+    $("count").firstChild.nodeValue = showTotal ? totalCount : frameCount;
+    $("status").textContent = `処理 ${(performance.now() - t0).toFixed(0)} ms/フレーム`;
+  } catch (e) { $("status").textContent = "推論エラー: " + e.message; running = false; return; }
+  requestAnimationFrame(loop);
+}
+
+// ===== UI =====
+$("start").onclick = async () => {
+  if (!session) return;
+  if (running) { running = false; $("start").textContent = "カメラ開始"; return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1280 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    running = true; $("start").textContent = "停止"; loop();
+  } catch (e) { $("status").textContent = "カメラ使用不可(HTTPSか許可設定を確認): " + e.message; }
+};
+$("reset").onclick = () => { totalCount = 0; maxCount = 0; tracks = []; shift = { x: 0, y: 0 }; };
+$("mode").onclick = () => { showTotal = !showTotal; $("modeLabel").textContent = showTotal ? "累計(トラッキング)" : "いま映っている数"; };
+$("conf").oninput = e => { $("confv").textContent = e.target.value; };
+$("rec").onclick = () => {
+  const r = { time: new Date().toISOString(), tree: $("tree").value, max: maxCount, total: totalCount, conf: $("conf").value };
+  records.push(r);
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${r.time.slice(11, 19)}</td><td>${r.tree.replace(/[<>&]/g, "")}</td><td>${r.max}</td><td>${r.total}</td>`;
+  $("tbl").tBodies[0].appendChild(tr);
+  $("reset").click();
+};
+$("csv").onclick = () => {
+  const head = "time,tree_id,max_in_frame,tracked_total,conf_threshold\n";
+  const body = records.map(r => [r.time, r.tree, r.max, r.total, r.conf].join(",")).join("\n");
+  const blob = new Blob(["\ufeff" + head + body], { type: "text/csv" }); // BOM付きでExcelの文字化け防止
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "mikan_count.csv"; a.click();
+};
+$("clr").onclick = () => { records = []; $("tbl").tBodies[0].innerHTML = ""; };
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js");
+loadModel();
+</script>
+</body>
+</html>
