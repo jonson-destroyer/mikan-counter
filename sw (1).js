@@ -1,4 +1,3 @@
-// 初回オンライン時に全ファイルをキャッシュし、以降はオフラインで動かす
 const CACHE = "mikan-v1";
 const FILES = [
   "./", "./index.html",
