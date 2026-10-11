@@ -9,4 +9,5 @@ async function detectMikan() {
     
     // リアルタイムで繰り返し実行
     requestAnimationFrame(detectMikan);
-}
+}// 例：軽量化モデルを読み込む場合
+session = await ort.InferenceSession.create('./best_quantized.onnx', { executionProviders: ['webgl'] });
