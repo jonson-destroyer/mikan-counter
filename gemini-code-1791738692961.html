@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>みかん個数リアルタイムカウンター</title>
+    <style>
+        body { margin: 0; background: #111; color: #fff; font-family: sans-serif; text-align: center; }
+        #counter { font-size: 24px; padding: 15px; background: #222; }
+        video, canvas { position: absolute; top: 60px; left: 50%; transform: translateX(-50%); max-width: 100%; }
+    </style>
+    <!-- ONNX Runtime Webの読み込み -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body>
+
+    <div id="counter">みかんの数: <span id="count">0</span> 個</div>
+    
+    <video id="webcam" autoplay playsinline muted width="640" height="640"></video>
+    <canvas id="canvas" width="640" height="640"></canvas>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const countSpan = document.getElementById('count');
+        let session;
+
+        async function init() {
+            // 1. スマホのカメラを起動
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' }, // 外側カメラ
+                    audio: false
+                });
+                video.srcObject = stream;
+            } catch (err) {
+                alert('カメラの起動に失敗しました: ' + err);
+            }
+
+            // 2. ONNXモデル（best.onnx）の読み込み
+            try {
+                session = await ort.InferenceSession.create('./best.onnx');
+                console.log('AIモデルの読み込み成功！');
+                detectFrame();
+            } catch (err) {
+                console.error('モデルの読み込み失敗:', err);
+            }
+        }
+
+        async function detectFrame() {
+            // ここにカメラのフレーム画像をAIに入力して推論する処理を記述します
+            // （※YOLOのプレプロセスと後処理のコードが続きます）
+
+            // 簡易的にループさせる
+            requestAnimationFrame(detectFrame);
+        }
+
+        init();
+    </script>
+</body>
+</html>
