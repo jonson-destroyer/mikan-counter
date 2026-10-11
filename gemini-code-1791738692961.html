@@ -7,7 +7,9 @@
     <style>
         body { margin: 0; background: #111; color: #fff; font-family: sans-serif; text-align: center; }
         #counter { font-size: 24px; padding: 15px; background: #222; }
-        video, canvas { position: absolute; top: 60px; left: 50%; transform: translateX(-50%); max-width: 100%; }
+        .video-container { position: relative; display: inline-block; margin-top: 20px; }
+        video, canvas { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+        canvas { position: absolute; top: 0; left: 0; }
     </style>
     <!-- ONNX Runtime Webの読み込み -->
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
@@ -16,19 +18,24 @@
 
     <div id="counter">みかんの数: <span id="count">0</span> 個</div>
     
-    <video id="webcam" autoplay playsinline muted width="640" height="640"></video>
-    <canvas id="canvas" width="640" height="640"></canvas>
+    <div class="video-container">
+        <video id="webcam" autoplay playsinline muted width="640" height="640"></video>
+        <canvas id="canvas" width="640" height="640"></canvas>
+    </div>
 
     <script>
         // Service Workerの登録
-if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js')
-            .then(() => console.log('オフラインの準備ができました！'))
-            .catch((err) => console.log('登録失敗: ', err));
-    });
-}
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js')
+                    .then(() => console.log('オフラインの準備ができました！'))
+                    .catch((err) => console.log('登録失敗: ', err));
+            });
+        }
+
         const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
         const countSpan = document.getElementById('count');
         let session;
 
@@ -36,30 +43,121 @@ if ('serviceWorker' in navigator) {
             // 1. スマホのカメラを起動
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'environment' }, // 外側カメラ
+                    video: { facingMode: 'environment', width: 640, height: 640 },
                     audio: false
                 });
                 video.srcObject = stream;
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => resolve();
+                });
             } catch (err) {
                 alert('カメラの起動に失敗しました: ' + err);
+                return;
             }
 
             // 2. ONNXモデル（best.onnx）の読み込み
             try {
-                session = await ort.InferenceSession.create('./best.onnx');
+                // WebGLバックエンドを使用すると高速に動作します
+                session = await ort.InferenceSession.create('./best.onnx', { executionProviders: ['webgl'] });
                 console.log('AIモデルの読み込み成功！');
                 detectFrame();
             } catch (err) {
                 console.error('モデルの読み込み失敗:', err);
+                alert('モデルの読み込みに失敗しました。');
             }
         }
 
         async function detectFrame() {
-            // ここにカメラのフレーム画像をAIに入力して推論する処理を記述します
-            // （※YOLOのプレプロセスと後処理のコードが続きます）
+            if (video.paused || video.ended) {
+                requestAnimationFrame(detectFrame);
+                return;
+            }
 
-            // 簡易的にループさせる
+            // キャンバスに現在のビデオフレームを描画
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+            try {
+                // YOLOv8用の前処理：画像をモデルの入力形式（1x3x640x640, Float32）に変換
+                const inputTensor = preprocess(imageData, 640, 640);
+
+                // 推論の実行
+                const feeds = { images: inputTensor };
+                const results = await session.run(feeds);
+                const output = results[session.outputNames[0]].data;
+
+                // 後処理：バウンディングボックスの解析とみかんのカウント
+                const detections = postprocess(output, 0.4, 0.5); // 信頼度閾値 0.4
+
+                // カウント数を画面に反映
+                countSpan.textContent = detections.length;
+
+                // 検出枠（バウンディングボックス）の描画
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                detections.forEach(box => {
+                    ctx.strokeStyle = '#00FF00';
+                    ctx.lineWidth = 3;
+                    ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1);
+                    
+                    ctx.fillStyle = '#00FF00';
+                    ctx.font = '16px sans-serif';
+                    ctx.fillText(`mikan ${Math.round(box.conf * 100)}%`, box.x1, box.y1 > 20 ? box.y1 - 5 : 20);
+                });
+
+            } catch (err) {
+                console.error('推論エラー:', err);
+            }
+
+            // 次のフレームへ
             requestAnimationFrame(detectFrame);
+        }
+
+        // 画像をYOLOv8の入力テンソルに変換する関数
+        function preprocess(imageData, targetWidth, targetHeight) {
+            const { data, width, height } = imageData;
+            const float32Data = new Float32Array(3 * targetWidth * targetHeight);
+
+            for (let i = 0; i < targetWidth * targetHeight; i++) {
+                // 簡単のため、そのままリサイズせずにコピーまたはフィットさせる基本処理
+                const r = data[i * 4] / 255.0;
+                const g = data[i * 4 + 1] / 255.0;
+                const b = data[i * 4 + 2] / 255.0;
+
+                // CHW形式（Channel x Height x Width）に配置
+                float32Data[i] = r;
+                float32Data[targetWidth * targetHeight + i] = g;
+                float32Data[targetWidth * targetHeight * 2 + i] = b;
+            }
+
+            return new ort.Tensor('float32', float32Data, [1, 3, targetHeight, targetWidth]);
+        }
+
+        // 出力結果を解析する簡易的な後処理関数（単一クラス・みかん検出用）
+        function postprocess(output, confThreshold, iouThreshold) {
+            const boxes = [];
+            // YOLOv8の出力形式 (1, 4 + クラス数, 8400) に合わせたパース処理
+            const numPredictions = 8400; // 640x640の場合のアンカー数目安
+            const numClasses = output.length / numPredictions - 4;
+
+            for (let i = 0; i < numPredictions; i++) {
+                const confidence = output[4 * numPredictions + i]; // クラススコア（単一クラス想定の場合は適宜調整）
+                if (confidence > confThreshold) {
+                    const xc = output[0 * numPredictions + i];
+                    const yc = output[1 * numPredictions + i];
+                    const w  = output[2 * numPredictions + i];
+                    const h  = output[3 * numPredictions + i];
+
+                    const x1 = xc - w / 2;
+                    const y1 = yc - h / 2;
+                    const x2 = xc + w / 2;
+                    const y2 = yc + h / 2;
+
+                    boxes.push({ x1, y1, x2, y2, conf: confidence });
+                }
+            }
+            return boxes;
         }
 
         init();
