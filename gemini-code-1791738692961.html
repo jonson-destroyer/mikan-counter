@@ -20,6 +20,14 @@
     <canvas id="canvas" width="640" height="640"></canvas>
 
     <script>
+        // Service Workerの登録
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+            .then(() => console.log('オフラインの準備ができました！'))
+            .catch((err) => console.log('登録失敗: ', err));
+    });
+}
         const video = document.getElementById('webcam');
         const countSpan = document.getElementById('count');
         let session;
